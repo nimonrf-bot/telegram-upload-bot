@@ -1,117 +1,111 @@
 import os
-import zipfile
+import logging
 import requests
 from datetime import datetime
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# -----------------------------------
-# CONFIG (LOAD FROM ENVIRONMENT)
-# -----------------------------------
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-NETLIFY_TOKEN = os.environ.get("NETLIFY_TOKEN")
-NETLIFY_SITE_ID = os.environ.get("NETLIFY_SITE_ID")
+# -------------------------------------------
+# Load environment variables (Railway)
+# -------------------------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+NETLIFY_TOKEN = os.getenv("NETLIFY_TOKEN")
+NETLIFY_SITE_ID = os.getenv("NETLIFY_SITE_ID")
+ALLOWED_USERS = os.getenv("ALLOWED_USERS", "")
 
-# Only these IDs can upload; add more later
-ALLOWED_USERS = [333686867]
+# Convert comma-separated IDs → integers set
+ALLOWED_USERS = {int(uid.strip()) for uid in ALLOWED_USERS.split(",") if uid.strip().isdigit()}
 
-TEMP_DIR = "temp_files"
-LOG_FILE = "upload_log.txt"
+# -------------------------------------------
+# Logging setup
+# -------------------------------------------
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-
-# -----------------------------------
-# LOGGING
-# -----------------------------------
-def log_event(text: str):
+def log_event(message: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {text}\n")
-    print(f"[{timestamp}] {text}")
+    logging.info(f"[{timestamp}] {message}")
 
+# -------------------------------------------
+# Upload file to Netlify
+# -------------------------------------------
+def upload_to_netlify(file_path, file_name):
+    try:
+        url = f"https://api.netlify.com/api/v1/sites/{NETLIFY_SITE_ID}/files/{file_name}"
 
-# -----------------------------------
-# ZIP + DEPLOY
-# -----------------------------------
-def create_and_upload_zip():
-    zip_name = "deploy.zip"
+        headers = {
+            "Authorization": f"Bearer {NETLIFY_TOKEN}",
+        }
 
-    xlsx_files = [
-        f for f in os.listdir(TEMP_DIR)
-        if f.lower().endswith(".xlsx")
-    ]
+        with open(file_path, "rb") as f:
+            response = requests.put(url, headers=headers, data=f)
 
-    if not xlsx_files:
-        log_event("No XLSX files found for deploy.")
+        if response.status_code in (200, 201):
+            return True
+        else:
+            log_event(f"Netlify upload FAILED: {response.status_code}, {response.text}")
+            return False
+
+    except Exception as e:
+        log_event(f"Upload error: {str(e)}")
         return False
 
-    with zipfile.ZipFile(zip_name, "w") as zipf:
-        for fname in xlsx_files:
-            full_path = os.path.join(TEMP_DIR, fname)
-            zipf.write(full_path, arcname=fname)
-
-    log_event(f"ZIP created with: {', '.join(xlsx_files)}")
-
-    url = f"https://api.netlify.com/api/v1/sites/{NETLIFY_SITE_ID}/deploys"
-    headers = {"Authorization": f"Bearer {NETLIFY_TOKEN}"}
-    files = {"file": open(zip_name, "rb")}
-
-    response = requests.post(url, headers=headers, files=files)
-
-    if response.status_code in (200, 201):
-        log_event("Netlify deploy SUCCESS.")
-        return True
-
-    log_event(f"Netlify deploy FAILED: {response.status_code} - {response.text}")
-    return False
-
-
-# -----------------------------------
-# TELEGRAM HANDLER
-# -----------------------------------
+# -------------------------------------------
+# Handle incoming files
+# -------------------------------------------
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-    user_id = user.id
-    username = user.username or user.first_name or "Unknown"
-    document = update.message.document
+    user_id = update.effective_user.id
 
-    log_event(f"Attempt by {username} (ID {user_id}) file={document.file_name}")
-
+    # Check allowed users
     if user_id not in ALLOWED_USERS:
-        await update.message.reply_text("❌ You are not allowed to upload files.")
-        log_event("Blocked: unauthorized user.")
+        await update.message.reply_text("You are not allowed to upload files.")
+        log_event(f"Unauthorized attempt by {user_id}")
         return
 
-    if not document.file_name.lower().endswith(".xlsx"):
-        await update.message.reply_text("Please send an .xlsx file.")
-        log_event("Rejected: non-xlsx file.")
+    doc = update.message.document
+
+    if not doc:
+        await update.message.reply_text("Please send a valid Excel file.")
         return
 
-    # Download to temp folder
-    file_path = os.path.join(TEMP_DIR, document.file_name)
-    tg_file = await document.get_file()
-    await tg_file.download_to_drive(file_path)
-    log_event(f"Downloaded: {document.file_name}")
+    file_name = doc.file_name
 
-    await update.message.reply_text("Processing file...")
-    success = create_and_upload_zip()
+    # Only accept xls/xlsx
+    if not (file_name.endswith(".xls") or file_name.endswith(".xlsx")):
+        await update.message.reply_text("Only Excel files (.xls, .xlsx) are allowed.")
+        return
+
+    # Download file to temp
+    file_path = f"/tmp/{file_name}"
+    new_file = await doc.get_file()
+    await new_file.download_to_drive(file_path)
+
+    log_event(f"Received file from {user_id}: {file_name}")
+
+    # Upload to Netlify
+    success = upload_to_netlify(file_path, file_name)
 
     if success:
-        await update.message.reply_text("✅ Upload completed successfully.")
+        await update.message.reply_text("✅ Upload successful.")
+        log_event(f"Upload success: {file_name}")
     else:
         await update.message.reply_text("❌ Upload failed.")
+        log_event(f"Upload FAILED: {file_name}")
 
-
-# -----------------------------------
-# MAIN
-# -----------------------------------
+# -------------------------------------------
+# Main bot starter
+# -------------------------------------------
 def main():
     log_event("Bot starting…")
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+
     app.run_polling()
 
-
+# -------------------------------------------
 if __name__ == "__main__":
     main()
