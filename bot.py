@@ -1,128 +1,138 @@
 import os
-import zipfile
+import logging
 import hashlib
 import requests
 from datetime import datetime
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
-# ============ CONFIG FROM RAILWAY ENV =============
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CallbackContext,
+    filters,
+)
+
+# ----------------------------------------------------
+# Logging
+# ----------------------------------------------------
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+log = logging.getLogger(__name__)
+
+def log_event(msg):
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    logging.info(f"{timestamp} {msg}")
+
+# ----------------------------------------------------
+# Load environment variables (Railway)
+# ----------------------------------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 NETLIFY_TOKEN = os.getenv("NETLIFY_TOKEN")
 NETLIFY_SITE_ID = os.getenv("NETLIFY_SITE_ID")
 ALLOWED_USERS = os.getenv("ALLOWED_USER_IDS", "")
-ALLOWED_USERS = [int(x.strip()) for x in ALLOWED_USERS.split(",") if x.strip().isdigit()]
 
-LOG_FILE = "bot.log"
+# Convert ALLOWED_USERS env string → set of ints
+ALLOWED_USERS = {int(uid.strip()) for uid in ALLOWED_USERS.split(",") if uid.strip().isdigit()}
 
-
-# ============ LOGGING =============
-def log_event(msg: str):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {msg}"
-    print(line)
-    with open(LOG_FILE, "a") as f:
-        f.write(line + "\n")
-
-
-# ============ NETLIFY UPLOAD (CORRECT VERSION) ============
-def upload_to_netlify(zip_path):
+# ----------------------------------------------------
+# Netlify Upload Function (FINAL)
+# ----------------------------------------------------
+def upload_to_netlify(file_path, filename):
     try:
-        # Read ZIP file
-        with open(zip_path, "rb") as f:
-            content = f.read()
+        if not NETLIFY_TOKEN or not NETLIFY_SITE_ID:
+            return False, "Missing Netlify token or site ID"
 
-        sha1 = hashlib.sha1(content).hexdigest()
-
-        # 1️⃣ Create deploy
-        create_url = f"https://api.netlify.com/api/v1/sites/{NETLIFY_SITE_ID}/deploys"
         headers = {"Authorization": f"Bearer {NETLIFY_TOKEN}"}
 
-        deploy_config = {"files": {"upload.zip": sha1}}
+        # STEP 1 → CREATE DEPLOY
+        create_url = f"https://api.netlify.com/api/v1/sites/{NETLIFY_SITE_ID}/deploys"
+        res = requests.post(create_url, headers=headers)
 
-        deploy_resp = requests.post(create_url, headers=headers, json=deploy_config)
+        if res.status_code != 200:
+            return False, f"Deploy create failed: {res.status_code} {res.text}"
 
-        if deploy_resp.status_code not in (200, 201):
-            return False, f"Deploy create failed: {deploy_resp.status_code} {deploy_resp.text}"
-
-        deploy_id = deploy_resp.json()["id"]
+        deploy_id = res.json()["id"]
         log_event(f"Created deploy: {deploy_id}")
 
-        # 2️⃣ Upload file
-        upload_url = f"https://api.netlify.com/api/v1/deploys/{deploy_id}/files/upload.zip"
+        # STEP 2 → READ FILE
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+
+        # STEP 3 → UPLOAD FILE to deploy
+        upload_url = f"https://api.netlify.com/api/v1/deploys/{deploy_id}/files/{filename}"
+
         upload_headers = {
             "Authorization": f"Bearer {NETLIFY_TOKEN}",
-            "Content-Type": "application/zip"
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(file_bytes)),
         }
 
-        upload_resp = requests.put(upload_url, headers=upload_headers, data=content)
+        res2 = requests.put(upload_url, headers=upload_headers, data=file_bytes)
 
-        if upload_resp.status_code not in (200, 201):
-            return False, f"Upload failed: {upload_resp.status_code} {upload_resp.text}"
+        if res2.status_code not in (200, 201):
+            return False, f"File upload failed: {res2.status_code} {res2.text}"
 
-        # 3️⃣ Publish deploy
+        # STEP 4 → PUBLISH DEPLOY
         publish_url = f"https://api.netlify.com/api/v1/deploys/{deploy_id}/publish"
-        publish_resp = requests.post(publish_url, headers=headers)
+        res3 = requests.post(publish_url, headers=headers)
 
-        if publish_resp.status_code not in (200, 201):
-            return False, f"Publish failed: {publish_resp.status_code} {publish_resp.text}"
+        if res3.status_code != 200:
+            return False, f"Publish failed: {res3.status_code} {res3.text}"
 
-        return True, "Upload and publish successful"
+        final_url = res3.json()["deploy_ssl_url"] + "/" + filename
+
+        return True, final_url
 
     except Exception as e:
-        return False, str(e)
+        return False, f"Exception: {str(e)}"
 
-
-# ============ TELEGRAM HANDLER ============
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+# ----------------------------------------------------
+# Handle document upload
+# ----------------------------------------------------
+async def handle_file(update: Update, context: CallbackContext):
+    user = update.effective_user
+    user_id = user.id
 
     if user_id not in ALLOWED_USERS:
         log_event(f"Unauthorized access attempt from {user_id}")
-        await update.message.reply_text("⛔ You are not allowed.")
+        await update.message.reply_text("❌ You are not allowed.")
         return
 
-    document = update.message.document
-    file_name = document.file_name
+    doc = update.message.document
+    filename = doc.file_name
+    log_event(f"File received from {user_id}: {filename}")
 
-    log_event(f"File received from {user_id}: {file_name}")
+    # Download file
+    file = await context.bot.get_file(doc.file_id)
+    file_path = f"/tmp/{filename}"
+    await file.download_to_drive(file_path)
 
-    tg_file = await document.get_file()
-    dl_path = f"download_{file_name}"
-    await tg_file.download_to_drive(dl_path)
+    log_event(f"Uploading {filename} to Netlify...")
 
-    # ZIP the file
-    zip_path = "upload.zip"
-    with zipfile.ZipFile(zip_path, "w") as z:
-        z.write(dl_path, arcname=file_name)
-
-    log_event(f"Uploading {file_name} to Netlify...")
-    ok, msg = upload_to_netlify(zip_path)
+    # Upload
+    ok, result = upload_to_netlify(file_path, filename)
 
     if ok:
-        log_event(f"SUCCESS: {file_name}")
-        await update.message.reply_text("✅ Upload successful.")
+        log_event(f"SUCCESS: {filename} → {result}")
+        await update.message.reply_text(f"✅ Upload complete:\n{result}")
     else:
-        log_event(f"FAIL: {file_name} — {msg}")
-        await update.message.reply_text("❌ Upload failed.")
+        log_event(f"FAIL: {filename} — {result}")
+        await update.message.reply_text(f"❌ Upload failed:\n{result}")
 
-    # cleanup local files
-    try:
-        os.remove(dl_path)
-        os.remove(zip_path)
-    except:
-        pass
-
-
-# ============ MAIN APP ============
+# ----------------------------------------------------
+# MAIN
+# ----------------------------------------------------
 def main():
     log_event("Bot starting…")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 
     app.run_polling()
 
-
+# ----------------------------------------------------
 if __name__ == "__main__":
     main()
